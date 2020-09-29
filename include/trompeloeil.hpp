@@ -129,11 +129,23 @@
 #include <cstring>
 #include <regex>
 #include <mutex>
-#include <atomic>
 #include <initializer_list>
 #include <type_traits>
 #include <utility>
 
+
+#ifndef TROMPELOEIL_CUSTOM_ATOMIC
+#include <atomic>
+namespace trompeloeil { using std::atomic; }
+#else
+#include <trompeloeil/custom_atomic.hpp>
+#endif
+
+#ifndef TROMPELOEIL_CUSTOM_UNIQUE_LOCK
+namespace trompeloeil { using std::unique_lock; }
+#else
+#include <trompeloeil/custom_unique_lock.hpp>
+#endif
 
 #ifdef TROMPELOEIL_SANITY_CHECKS
 #include <cassert>
@@ -341,6 +353,11 @@
   /**/
 
 #endif /* !(TROMPELOEIL_CPLUSPLUS == 201103L) */
+#if TROMPELOEIL_CPLUSPLUS > 201403L && (!TROMPELOEIL_GCC || TROMPELOEIL_GCC_VERSION >= 70000)
+#  define TROMPELOEIL_INLINE_VAR [[maybe_unused]] static inline
+#else
+#  define TROMPELOEIL_INLINE_VAR static
+#endif
 
 static constexpr bool trompeloeil_movable_mock = false;
 
@@ -393,6 +410,23 @@ namespace trompeloeil
 
   namespace detail
   {
+    template <typename T>
+    struct unwrap_type
+    {
+      using type = T;
+    };
+    template <typename T>
+    struct unwrap_type<std::reference_wrapper<T>>
+    {
+      using type = T&;
+    };
+    template <typename ... Ts>
+    std::tuple<typename unwrap_type<typename std::decay<Ts>::type>::type...>
+    make_tuple(Ts&& ... ts)
+    {
+      return { std::forward<Ts>(ts)... };
+    }
+
     /* Implement C++14 features using only C++11 entities. */
 
     /* <memory> */
@@ -708,7 +742,7 @@ namespace trompeloeil
 #ifndef TROMPELOEIL_CUSTOM_RECURSIVE_MUTEX
 
   template <typename T = void>
-  std::unique_lock<std::recursive_mutex> get_lock()
+  unique_lock<std::recursive_mutex> get_lock()
   {
     // Ugly hack for lifetime of mutex. The statically allocated
     // recursive_mutex is intentionally leaked, to ensure that the
@@ -718,7 +752,7 @@ namespace trompeloeil
 
     static aligned_storage_for<std::recursive_mutex> buffer;
     static auto mutex = new (&buffer) std::recursive_mutex;
-    return std::unique_lock<std::recursive_mutex>{*mutex};
+    return unique_lock<std::recursive_mutex>{*mutex};
   }
 
 #else
@@ -734,10 +768,11 @@ namespace trompeloeil
   std::unique_ptr<custom_recursive_mutex> create_custom_recursive_mutex();
 
   template <typename T = void>
-  std::unique_lock<custom_recursive_mutex> get_lock() {
+  unique_lock<custom_recursive_mutex> get_lock()
+  {
     static std::unique_ptr<custom_recursive_mutex> mtx =
         create_custom_recursive_mutex();
-    return std::unique_lock<custom_recursive_mutex>{*mtx};
+    return unique_lock<custom_recursive_mutex>{*mtx};
   }
 
 #endif
@@ -1041,13 +1076,21 @@ namespace trompeloeil
 
   struct wildcard : public matcher
   {
-    template <typename T>
+    template <typename T
+#if TROMPELOEIL_GCC && TROMPELOEIL_GCC_VERSION >= 50000
+              ,detail::enable_if_t<!std::is_convertible<wildcard&, T>{}>* = nullptr
+#endif
+              >
     operator T&&()
     const;
 
-    template <typename T>
+    template <typename T
+#if TROMPELOEIL_GCC && TROMPELOEIL_GCC_VERSION >= 50000
+              ,detail::enable_if_t<!std::is_convertible<wildcard&, T>{}>* = nullptr
+#endif
+              >
     operator T&()
-    const volatile; // less preferred than T&& above
+    volatile const; // less preferred than T&& above
 
     template <typename T>
     constexpr
@@ -1071,8 +1114,7 @@ namespace trompeloeil
     }
   };
 
-  static constexpr wildcard const _{};
-
+  TROMPELOEIL_INLINE_VAR wildcard _{};
 
 template <typename T>
   using matcher_access = decltype(static_cast<matcher*>(std::declval<typename std::add_pointer<T>::type>()));
@@ -2666,7 +2708,7 @@ template <typename T>
       sequences.reset(seq);
     }
   private:
-    std::atomic<bool>  died{false};
+    atomic<bool>       died{false};
     lifetime_monitor *&object_monitor;
     location           loc;
     char const        *object_name;
@@ -3867,8 +3909,8 @@ template <typename T>
     std::unique_ptr<return_handler<Sig>>   return_handler_obj;
     std::unique_ptr<sequence_handler_base> sequences;
     size_t                                 call_count = 0;
-    std::atomic<size_t>                    min_calls{1};
-    std::atomic<size_t>                    max_calls{1};
+    atomic<size_t>                         min_calls{1};
+    atomic<size_t>                         max_calls{1};
     Value                                  val;
     bool                                   reported = false;
   };
@@ -4101,7 +4143,7 @@ template <typename T>
 
   template <typename ... U>
   struct param_helper {
-    using type = decltype(std::make_tuple(std::declval<U>()...));
+    using type = decltype(detail::make_tuple(std::declval<U>()...));
   };
 
   template <typename ... U>
@@ -4697,7 +4739,7 @@ template <typename T>
   with(                                                                        \
     arg_s,                                                                     \
     [capture]                                                                  \
-    (trompeloeil_e_t::trompeloeil_call_params_type_t const& trompeloeil_x)     \
+    (typename trompeloeil_e_t::trompeloeil_call_params_type_t const& trompeloeil_x)\
     {                                                                          \
       auto& _1 = ::trompeloeil::mkarg<1>(trompeloeil_x);                       \
       auto& _2 = ::trompeloeil::mkarg<2>(trompeloeil_x);                       \
@@ -4753,7 +4795,9 @@ template <typename T>
 
 #define TROMPELOEIL_SIDE_EFFECT_(capture, ...)                                 \
   sideeffect(                                                                  \
-    [capture](trompeloeil_e_t::trompeloeil_call_params_type_t& trompeloeil_x) {\
+    [capture]                                                                  \
+    (typename trompeloeil_e_t::trompeloeil_call_params_type_t& trompeloeil_x)  \
+    {                                                                          \
       auto& _1 = ::trompeloeil::mkarg<1>(trompeloeil_x);                       \
       auto& _2 = ::trompeloeil::mkarg<2>(trompeloeil_x);                       \
       auto& _3 = ::trompeloeil::mkarg<3>(trompeloeil_x);                       \
@@ -4808,8 +4852,9 @@ template <typename T>
 
 #define TROMPELOEIL_RETURN_(capture, ...)                                      \
   handle_return(                                                               \
-    [capture](trompeloeil_e_t::trompeloeil_call_params_type_t& trompeloeil_x)  \
-      -> trompeloeil_e_t::trompeloeil_return_of_t                              \
+    [capture]                                                                  \
+    (typename trompeloeil_e_t::trompeloeil_call_params_type_t& trompeloeil_x)  \
+      -> typename trompeloeil_e_t::trompeloeil_return_of_t                     \
     {                                                                          \
       auto& _1 = ::trompeloeil::mkarg<1>(trompeloeil_x);                       \
       auto& _2 = ::trompeloeil::mkarg<2>(trompeloeil_x);                       \
@@ -4865,7 +4910,9 @@ template <typename T>
 
 #define TROMPELOEIL_THROW_(capture, ...)                                       \
   handle_throw(                                                                \
-    [capture](trompeloeil_e_t::trompeloeil_call_params_type_t& trompeloeil_x) {\
+    [capture]                                                                  \
+    (typename trompeloeil_e_t::trompeloeil_call_params_type_t& trompeloeil_x)  \
+    {                                                                          \
       auto& _1 = ::trompeloeil::mkarg<1>(trompeloeil_x);                       \
       auto& _2 = ::trompeloeil::mkarg<2>(trompeloeil_x);                       \
       auto& _3 = ::trompeloeil::mkarg<3>(trompeloeil_x);                       \
