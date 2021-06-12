@@ -89,9 +89,9 @@ namespace trompeloeil
   template <>
   inline void reporter<specialized>::send(      //** 3 **//
     severity s,
-    const char* file,
+    char const* file,
     unsigned long line,
-    const char* msg)
+    std::string const& msg)
   {
     auto f = line ? file : "[file/line unavailable]";
     if (s == severity::fatal)
@@ -183,10 +183,11 @@ are no expectations. In these cases `file` will be `""` string and
 `line` == 0.
 
 ### Status OK reporting
+
 It is possible to make an adaption to the reporter that will be called if
 a positive expectation is met. This can be useful for correct counting and reporting
 from the testing framework. Negative expectations like `FORBID_CALL` and
-`.TIMES(0)` are not counted. 
+`.TIMES(0)` are not counted.
 
 Either provide your adapter as an inline specialization of the
 `trompeloeil::reporter<trompeloeil::specialized>::sendOk()` function at
@@ -202,7 +203,7 @@ work, in the file `<catch2/trompeloeil.hpp>`
   template <>
   inline void reporter<specialized>::sendOk(
     const char* trompeloeil_mock_calls_done_correctly)
-  {      
+  {
       REQUIRE(trompeloeil_mock_calls_done_correctly);
   }
 ```
@@ -239,6 +240,7 @@ TEST_CASE("Foo test")
 ```
 
 When the test is executed we get the following output
+
 ```sh
 $ ./footest
 ===============================================================================
@@ -600,8 +602,8 @@ Like this:
 
 Test(...
 ```
-If you instead prefer a runtime adapter, make sure to call
 
+If you instead prefer a runtime adapter, make sure to call
 
 ```Cpp
   trompeloeil::set_reporter([](
@@ -1263,6 +1265,31 @@ void test()
 Above, each of the `func` overloads must be called once, the `int*` version with
 any pointer value at all, and the `char*` version with a non-null value.
 
+Matching overloads on constness is done by placing the expectation on
+a const or non-const object.
+
+Example:
+```c++
+class Mock
+{
+public:
+  MAKE_MOCK1(func, void(int));
+  MAKE_CONST_MOCK1(func, void(int));
+};
+
+void test()
+{
+  Mock m;
+  
+  REQUIRE_CALL(m, func(3));   // non-const overload
+  
+  const Mock& mc = m;
+  REQUIRE_CALL(mc, func(-3)); // const overload
+  
+  m.func(3); // calls non-const overlod
+  mc.func(-3); // calls const overload
+}
+```
 ### <A name="side_effects"/> Define side effects for matching calls
 
 A side effect, in *Trompeloeil* parlance, is something that is done after
@@ -1458,7 +1485,7 @@ By default it is illegal to call any
 [mock function](reference.md/#mock_function) and you provide narrow specific
 expectations according to the needs of your test. However, sometimes it makes
 sense to have a wide-open default. That is done with the
-[exceptations](reference.md/#expectation)
+[expectations](reference.md/#expectation)
 [**`ALLOW_CALL(...)`**](reference.md/#ALLOW_CALL) and
 [**`NAMED_ALLOW_CALL(...)`**](reference.md/#NAMED_ALLOW_CALL). The difference
 between them is that **`ALLOW_CALL`** is local in nature and is only valid
@@ -1673,7 +1700,7 @@ sequence objects, which is a way to allow some variation in order, without
 being too lax. For a more thorough walk through, see the blog post [Sequence
 control with the Trompeloeil C\+\+14 Mocking Framework](http://playfulprogramming.blogspot.se/2015/01/sequence-control-with-trompeloeil-c.html)
 
-[**`.IN_SEQUNECE(...)`**](reference.md/#IN_SEQUENCE) can also be used on
+[**`.IN_SEQUENCE(...)`**](reference.md/#IN_SEQUENCE) can also be used on
 [**`REQUIRE_DESTRUCTION(...)`**](reference.md/#REQUIRE_DESTRUCTION) and
 [**`NAMED_REQUIRE_DESTRUCTION(...)`**](reference.md/#NAMED_REQUIRE_DESTRUCTION).
 
@@ -1961,7 +1988,7 @@ values. It is implemented using the standard library algorithm
 allowing a parameter to match any of a set of values.
 
 To create a matcher, you provide a function that calls
-[**`trompeleil::make_matcher<Type>(...)`**](reference.md/#make_matcher).
+[**`trompeloeil::make_matcher<Type>(...)`**](reference.md/#make_matcher).
 
 Below is the code for the function `any_of(std::initializer_list<int>)`
 which creates the matcher.

@@ -10,10 +10,11 @@ include(CheckCXXCompilerFlag)
 
 write_basic_package_version_file(
   "${CMAKE_CURRENT_BINARY_DIR}/trompeloeil/trompeloeil-config-version.cmake"
-  VERSION 38
+  VERSION 40
   COMPATIBILITY AnyNewerVersion)
 
 add_library(trompeloeil INTERFACE)
+add_library(trompeloeil::trompeloeil ALIAS trompeloeil)
 
 set(INCLUDE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
@@ -72,18 +73,73 @@ if (MASTER_PROJECT AND CMAKE_BUILD_TYPE MATCHES Debug)
 
   if(CMAKE_CXX_COMPILER_ID MATCHES "Clang" OR CMAKE_CXX_COMPILER_ID MATCHES "GNU")
 
-    # kcov is only available on Linux platforms.
-	ExternalProject_Add(
-	  kcov
-	  GIT_REPOSITORY
-		https://github.com/simonkagstrom/kcov
-	  GIT_TAG
-		v34
-	  INSTALL_DIR
-		${CMAKE_CURRENT_BINARY_DIR}/kcov
-	  CMAKE_ARGS
-		"-DCMAKE_INSTALL_PREFIX=${CMAKE_CURRENT_BINARY_DIR}/kcov"
-	  )
+    set(
+      LIBCXX_PREFIX_PATH
+      "/usr/lib/llvm-8"
+      CACHE
+      PATH
+      "Path prefix to libc++"
+    )
+
+    # Interpret CXX_STDLIB, if specified
+    if (NOT "${CXX_STDLIB}" STREQUAL "")
+
+      if (CMAKE_CXX_COMPILER_ID MATCHES "GNU")
+
+        # Emulate -stdlib for g++
+        if ("${CXX_STDLIB}" STREQUAL "libc++")
+
+          # Disable standard library and
+          # set include path to appropriate libc++ headers
+          string(CONCAT
+                 LIBCXX_INCLUDE_PATH
+                 "-isystem"
+                 "${LIBCXX_PREFIX_PATH}"
+                 "/include/c++/v1")
+          string(CONCAT
+                 STDLIB_COMPILE_FLAGS
+                 "-nostdinc++"
+                 " "
+                 "${LIBCXX_INCLUDE_PATH}")
+          set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${STDLIB_COMPILE_FLAGS}")
+
+        elseif ("${CXX_STDLIB}" STREQUAL "libstdc++")
+
+          # This is the default library for g++, nothing to do.
+
+        else()
+
+          # Unknown CXX_STDLIB option
+          message(FATAL_ERROR
+                  "CXX_STDLIB only understands libc++ and libstdc++, not "
+                  "'${CXX_STDLIB}'")
+
+        endif()
+
+      elseif (CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+
+        if (("${CXX_STDLIB}" STREQUAL "libc++") OR
+            ("${CXX_STDLIB}" STREQUAL "libstdc++"))
+
+          set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -stdlib=${CXX_STDLIB}")
+
+        else()
+
+          # Unknown CXX_STDLIB option
+          message(FATAL_ERROR
+                  "CXX_STDLIB only understands libc++ and libstdc++, not "
+                  "'${CXX_STDLIB}'")
+
+        endif()
+
+      else()
+
+        message(FATAL_ERROR
+                "Only g++ and Clang++ compilers support CXX_STDLIB")
+
+      endif()
+
+    endif()
 
     if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
       string(CONCAT
@@ -101,6 +157,15 @@ if (MASTER_PROJECT AND CMAKE_BUILD_TYPE MATCHES Debug)
                WARN_FLAGS
                " -Wno-extra-semi-stmt")
       endif()
+
+      check_cxx_compiler_flag("-Wno-zero-as-null-pointer-constant" WARN_ZERO_NULL)
+
+      if (WARN_ZERO_NULL)
+        string(APPEND
+               WARN_FLAGS
+               " -Wno-zero-as-null-pointer-constant")
+      endif()
+
     elseif(CMAKE_CXX_COMPILER_ID MATCHES "GNU")
       string(CONCAT
              WARN_FLAGS
@@ -109,6 +174,13 @@ if (MASTER_PROJECT AND CMAKE_BUILD_TYPE MATCHES Debug)
              " -pedantic"
              " -Wshadow"
              " -Wconversion")
+        check_cxx_compiler_flag("-Wnonnull" WARN_NONNULL)
+
+        if (WARN_NONNULL)
+            string(APPEND
+                    WARN_FLAGS
+                    " -Wnonnull")
+        endif()
     endif()
 
     set(WARN_FLAGS "${WARN_FLAGS} -Werror")
@@ -143,6 +215,7 @@ if (MASTER_PROJECT AND CMAKE_BUILD_TYPE MATCHES Debug)
 
     add_compile_options(/W4)
     add_compile_options(/bigobj)
+    add_compile_options(/EHsc)
 
     check_cxx_compiler_flag(/permissive HAS_PERMISSIVE_FLAG)
     if(HAS_PERMISSIVE_FLAG)
@@ -165,7 +238,7 @@ if (MASTER_PROJECT AND CMAKE_BUILD_TYPE MATCHES Debug)
     ${CATCH_DIR}
   )
 
-  if (SANITIZE)
+  if (SANITIZE AND NOT APPLE)
     set_target_properties(
       self_test
       PROPERTIES
@@ -216,10 +289,16 @@ if (MASTER_PROJECT AND CMAKE_BUILD_TYPE MATCHES Debug)
     custom_recursive_mutex
     PUBLIC
     trompeloeil
-    pthread
   )
+  if (NOT MSVC)
+      target_link_libraries(
+              custom_recursive_mutex
+              PUBLIC
+              pthread
+      )
+  endif()
 
-  if (SANITIZE)
+  if (SANITIZE AND NOT APPLE)
     set_target_properties(
       custom_recursive_mutex
       PROPERTIES
@@ -228,6 +307,73 @@ if (MASTER_PROJECT AND CMAKE_BUILD_TYPE MATCHES Debug)
         COMPILE_FLAGS
           ${SSAN}
       )
+  endif()
+
+  # Linker support for CXX_STDLIB argument
+  if (NOT ("${CXX_STDLIB}" STREQUAL ""))
+
+    if (CMAKE_CXX_COMPILER_ID MATCHES "GNU")
+
+      if ("${CXX_STDLIB}" STREQUAL "libc++")
+
+        set(LIBCXX_LIBRARY_PATH "${LIBCXX_PREFIX_PATH}/lib")
+        set(STDLIB_LINK_FLAGS
+          -nodefaultlibs
+          -L${LIBCXX_LIBRARY_PATH}
+          -Wl,-rpath,${LIBCXX_LIBRARY_PATH}
+        )
+        set(STDLIB_LINK_LIBRARIES
+          "-lc++"
+          "-lc++abi"
+          "-lm"
+          "-lc"
+          "-lgcc_s"
+          "-lgcc"
+        )
+
+        set_target_properties(
+          self_test
+          PROPERTIES
+            LINK_FLAGS
+              ${STDLIB_LINK_FLAGS}
+        )
+
+        target_link_libraries(
+          self_test
+          PUBLIC
+            ${STDLIB_LINK_LIBRARIES}
+        )
+
+        set_target_properties(
+          thread_terror
+          PROPERTIES
+            LINK_FLAGS
+              ${STDLIB_LINK_FLAGS}
+        )
+
+        target_link_libraries(
+          thread_terror
+          PUBLIC
+            ${STDLIB_LINK_LIBRARIES}
+        )
+
+        set_target_properties(
+          custom_recursive_mutex
+          PROPERTIES
+            LINK_FLAGS
+              ${STDLIB_LINK_FLAGS}
+        )
+
+        target_link_libraries(
+          custom_recursive_mutex
+          PUBLIC
+            ${STDLIB_LINK_LIBRARIES}
+        )
+
+      endif()
+
+    endif()
+
   endif()
 
   # Shameless hack to get target to work on Windows.
@@ -253,19 +399,14 @@ if (MASTER_PROJECT AND CMAKE_BUILD_TYPE MATCHES Debug)
 
   endif()
 
-  if(TRAVIS_JOB_ID)
-    set(COVERALLS_FLAG "--coveralls-id=${TRAVIS_JOB_ID}")
-  endif()
-
   if(CMAKE_CXX_COMPILER_ID MATCHES "Clang" OR CMAKE_CXX_COMPILER_ID MATCHES "GNU")
 
     add_custom_target(
       run_coverage
       COMMAND
-        ${CMAKE_CURRENT_BINARY_DIR}/kcov/bin/kcov --skip-solibs --include-pattern=trompeloeil.hpp ${COVERALLS_FLAG} ./coverage ${CMAKE_CURRENT_BINARY_DIR}/self_test
+        kcov --skip-solibs --include-pattern=trompeloeil.hpp ./coverage ${CMAKE_CURRENT_BINARY_DIR}/self_test
       DEPENDS
         self_test
-        kcov
     )
 
   endif()

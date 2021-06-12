@@ -1,7 +1,7 @@
 /*
  * Trompeloeil C++ mocking framework
  *
- * Copyright Björn Fahller 2014-2019
+ * Copyright (C) Björn Fahller 2014-2021
  * Copyright (C) 2017, 2018 Andrew Paxie
  * Copyright Tore Martin Hagen 2019
  *
@@ -129,6 +129,8 @@
 #include <cstring>
 #include <regex>
 #include <mutex>
+#include <atomic>
+#include <array>
 #include <initializer_list>
 #include <type_traits>
 #include <utility>
@@ -534,7 +536,7 @@ namespace trompeloeil
       return old_value;
     }
 
-    /* integer_sequence and index_sequence implemenations are from
+    /* integer_sequence and index_sequence implementations are from
      *
      * Jonathan Wakely, "Compile-time integer sequences,"
      * ISO/IEC JTC1 SC22 WG21 N3658, 18 April 2013.
@@ -1196,11 +1198,11 @@ template <typename T>
 #if !TROMPELOEIL_CLANG
     template <
       typename T,
-      typename = detail::enable_if_t<!std::is_constructible<T, std::nullptr_t>::value>
+      typename = detail::enable_if_t<std::is_convertible<std::nullptr_t, T>::value>
     >
     operator T&&() const = delete;
 #endif
-#if TROMPELOEIL_GCC
+#if TROMPELOEIL_GCC || TROMPELOEIL_MSVC
 
     template <typename T, typename C, typename ... As>
     using memfunptr = T (C::*)(As...);
@@ -1231,6 +1233,18 @@ template <typename T>
   using is_null_comparable = is_equal_comparable<T, indirect_null>;
 #endif
 
+  template <typename T, typename = decltype(std::declval<T const&>() == nullptr)>
+  inline
+  constexpr
+  auto
+  is_null_redirect(
+    T const &t)
+  noexcept(noexcept(std::declval<T const&>() == nullptr))
+  -> decltype(t == nullptr)
+  {
+    return t == nullptr;
+  }
+
   template <typename T>
   inline
   constexpr
@@ -1238,10 +1252,23 @@ template <typename T>
   is_null(
     T const &t,
     std::true_type)
-  noexcept(noexcept(std::declval<T const&>() == nullptr))
-  -> decltype(t == nullptr)
+  noexcept(noexcept(is_null_redirect(t)))
+  -> decltype(is_null_redirect(t))
   {
-    return t == nullptr;
+    // Redirect evaluation to supress wrong non-null warnings in g++ 9 and 10.
+    return is_null_redirect(t);
+  }
+
+  template <typename T, typename V>
+  inline
+  constexpr
+  bool
+  is_null(
+    T const &,
+    V)
+  noexcept
+  {
+    return false;
   }
 
   template <typename T>
@@ -1776,6 +1803,17 @@ template <typename T>
     const
     noexcept;
 
+    unsigned
+    cost(
+      sequence_matcher const *m)
+    const
+    noexcept;
+
+    void
+    retire_until(
+      sequence_matcher const* m)
+    noexcept;
+
     void
     add_last(
       sequence_matcher *m)
@@ -1804,18 +1842,23 @@ template <typename T>
     std::unique_ptr<sequence_type> obj;
   };
 
+  struct sequence_handler_base;
+
   class sequence_matcher : public list_elem<sequence_matcher>
   {
   public:
     using init_type = std::pair<char const*, sequence&>;
+
     sequence_matcher(
       char const *exp,
       location loc,
+      const sequence_handler_base& handler,
       init_type i)
     noexcept
     : seq_name(i.first)
     , exp_name(exp)
     , exp_loc(loc)
+    , sequence_handler(handler)
     , seq(*i.second)
     {
       auto lock = get_lock();
@@ -1832,19 +1875,31 @@ template <typename T>
       seq.validate_match(s, this, seq_name, match_name, loc);
     }
 
-    bool
-    is_first()
+    unsigned
+    cost()
     const
     noexcept
     {
-      return seq.is_first(this);
+      return seq.cost(this);
     }
+
+    bool
+    is_satisfied()
+      const
+      noexcept;
 
     void
     retire()
     noexcept
     {
       this->unlink();
+    }
+
+    void
+    retire_predecessors()
+    noexcept
+    {
+      seq.retire_until(this);
     }
 
     void
@@ -1864,6 +1919,7 @@ template <typename T>
     char const *seq_name;
     char const *exp_name;
     location    exp_loc;
+    const sequence_handler_base& sequence_handler;
     sequence_type& seq;
   };
 
@@ -1884,6 +1940,40 @@ template <typename T>
   noexcept
   {
     return !matchers.empty() && &*matchers.begin() == m;
+  }
+
+  inline
+  unsigned
+  sequence_type::cost(
+    sequence_matcher const* m)
+  const
+  noexcept
+  {
+    unsigned sequence_cost = 0U;
+    for (auto& e : matchers)
+    {
+      if (&e == m) return sequence_cost;
+      if (!e.is_satisfied())
+      {
+        return ~0U;
+      }
+      ++sequence_cost;
+    }
+    return ~0U;
+  }
+
+  inline
+  void
+  sequence_type::retire_until(
+    sequence_matcher const* m)
+  noexcept
+  {
+    while (!matchers.empty())
+    {
+      auto first = &*matchers.begin();
+      if (first == m) return;
+      first->retire();
+    }
   }
 
   inline
@@ -2532,9 +2622,69 @@ template <typename T>
 
   struct sequence_handler_base
   {
+  private:
+    size_t min_calls{1};
+    size_t max_calls{1};
+    size_t call_count{0};
+  public:
+
     virtual
     ~sequence_handler_base()
     noexcept = default;
+
+    void
+      increment_call()
+      noexcept
+    {
+      ++call_count;
+    }
+    bool
+      is_satisfied()
+      const
+      noexcept
+    {
+      return call_count >= min_calls;
+    }
+
+    bool
+      is_saturated()
+      const
+      noexcept
+    {
+      return call_count == max_calls;
+    }
+
+    bool
+      is_forbidden()
+      const
+      noexcept
+    {
+      return max_calls == 0ULL;
+    }
+
+    void
+    set_limits(size_t L, size_t H)
+      noexcept
+    {
+      min_calls = L;
+      max_calls = H;
+    }
+
+    size_t
+    get_min_calls()
+      const
+      noexcept
+    {
+      return min_calls;
+    }
+
+    size_t
+      get_calls()
+      const
+      noexcept
+    {
+      return call_count;
+    }
 
     virtual
     void
@@ -2542,27 +2692,57 @@ template <typename T>
 
     virtual
     bool
-      is_first()
-      const
-      noexcept = 0;
+    can_be_called()
+    const
+    noexcept = 0;
+
+    virtual
+    unsigned
+    order()
+    const
+    noexcept = 0;
 
     virtual
     void
       retire()
       noexcept = 0;
+
+    virtual
+    void
+    retire_predecessors()
+    noexcept = 0;
+  protected:
+    sequence_handler_base() = default;
+    sequence_handler_base(const sequence_handler_base&) = default;
   };
+
+  inline
+  bool
+  sequence_matcher::is_satisfied()
+  const
+  noexcept
+  {
+    return sequence_handler.is_satisfied();
+  }
 
   template <size_t N>
   struct sequence_handler : public sequence_handler_base
   {
   public:
+    template <size_t M = N, typename detail::enable_if_t<M == 0>* = nullptr>
+    sequence_handler()
+      noexcept
+    {}
+
     template <typename ... S>
     sequence_handler(
+      const sequence_handler_base& base,
       char const *name,
       location loc,
       S&& ... s)
     noexcept
-      : matchers{{name, loc, std::forward<S>(s)}...}
+      : sequence_handler_base(base)
+      , matchers{{sequence_matcher{name, loc, *this, std::forward<S>(s)}...}}
     {
     }
 
@@ -2579,20 +2759,31 @@ template <typename T>
       }
     }
 
-    bool
-    is_first()
+    unsigned
+    order()
     const
     noexcept
     override
     {
-      // std::all_of() is almost always preferable. The only reason
-      // for using a hand rolled loop is because it cuts compilation
-      // times quite noticeably (almost 10% with g++5.1)
+      unsigned highest_order = 0U;
       for (auto& m : matchers)
       {
-        if (!m.is_first()) return false;
+        auto cost = m.cost();
+        if (cost > highest_order)
+        {
+          highest_order = cost;
+        }
       }
-      return true;
+      return highest_order;
+    }
+
+    bool
+    can_be_called()
+    const
+    noexcept
+    override
+    {
+      return order() != ~0U;
     }
 
     void
@@ -2605,8 +2796,23 @@ template <typename T>
         e.retire();
       }
     }
+
+    void
+    retire_predecessors()
+    noexcept
+      override
+    {
+      for (auto& e : matchers)
+      {
+        e.retire_predecessors();
+      }
+    }
   private:
-    sequence_matcher matchers[N];
+    // work around for MS STL ossue 942
+    // https://github.com/microsoft/STL/issues/942
+    detail::conditional_t<N == 0,
+                          std::vector<sequence_matcher>,
+                          std::array<sequence_matcher, N>> matchers;
   };
 
   struct lifetime_monitor;
@@ -2694,7 +2900,7 @@ template <typename T>
     noexcept
     {
       died = true;
-      if (sequences) sequences->validate(severity::nonfatal, call_name, loc);
+      sequences->validate(severity::nonfatal, call_name, loc);
     }
 
     template <typename ... T>
@@ -2702,10 +2908,12 @@ template <typename T>
     set_sequence(
       T&& ... t)
     {
-      auto seq = new sequence_handler<sizeof...(T)>(invocation_name,
-                                                    loc,
-                                                    std::forward<T>(t)...);
-      sequences.reset(seq);
+      using handler = sequence_handler<sizeof...(T)>;
+      auto seq = detail::make_unique<handler>(*sequences,
+                                              invocation_name,
+                                              loc,
+                                              std::forward<T>(t)...);
+      sequences = std::move(seq);
     }
   private:
     atomic<bool>       died{false};
@@ -2714,7 +2922,7 @@ template <typename T>
     char const        *object_name;
     char const        *invocation_name;
     char const        *call_name;
-    std::unique_ptr<sequence_handler_base>  sequences;
+    std::unique_ptr<sequence_handler_base>  sequences = detail::make_unique<sequence_handler<0>>();
   };
 
   template <typename T>
@@ -2843,8 +3051,8 @@ template <typename T>
     const = 0;
 
     virtual
-    bool
-    first_in_sequence()
+    unsigned
+    sequence_cost()
     const
     noexcept = 0;
 
@@ -3127,17 +3335,20 @@ template <typename T>
   noexcept
   {
     call_matcher_base<Sig>* first_match = nullptr;
+    unsigned lowest_cost = ~0U;
     for (auto& i : list)
     {
       if (i.matches(p))
       {
-        if (i.first_in_sequence())
+        unsigned cost = i.sequence_cost();
+        if (cost == 0)
         {
           return &i;
         }
-        if (!first_match)
+        if (!first_match || cost < lowest_cost)
         {
           first_match = &i;
+          lowest_cost = cost;
         }
       }
     }
@@ -3577,8 +3788,7 @@ template <typename T>
       static_assert(H > 0 || !sequence_set,
                     "IN_SEQUENCE and TIMES(0) does not make sense");
 
-      matcher->min_calls = L;
-      matcher->max_calls = H;
+      matcher->sequences->set_limits(L, H);
       return {matcher};
     }
 
@@ -3693,7 +3903,7 @@ template <typename T>
       override
     {
       auto lock = get_lock();
-      return call_count >= min_calls;
+      return sequences->is_satisfied();
     }
 
     bool
@@ -3703,14 +3913,14 @@ template <typename T>
       override
     {
       auto lock = get_lock();
-      return call_count >= max_calls;
+      return sequences->is_saturated();
     }
     bool
     is_unfulfilled()
     const
     noexcept
     {
-      return !reported && this->is_linked() && call_count < min_calls;
+      return !reported && this->is_linked() && !sequences->is_satisfied();
     }
 
     void
@@ -3756,14 +3966,13 @@ template <typename T>
       return true;
     }
 
-    bool
-    first_in_sequence()
-    const
-    noexcept
-    override
+    unsigned
+    sequence_cost()
+      const
+      noexcept
+      override
     {
-      auto saturated = call_count >= min_calls;
-      return saturated || !sequences || sequences->is_first();
+      return sequences->order();
     }
 
     return_of_t<Sig>
@@ -3782,23 +3991,25 @@ template <typename T>
       call_matcher_list<Sig> &saturated_list)
     override
     {
-      if (max_calls == 0)
+      if (sequences->is_forbidden())
       {
         reported = true;
         report_forbidden_call(name, loc, params_string(params));
       }
       auto lock = get_lock();
       {
-        if (call_count < min_calls && sequences)
+        if (!sequences->can_be_called())
         {
           sequences->validate(severity::fatal, name, loc);
         }
-        if (++call_count == min_calls && sequences)
+        sequences->increment_call();
+        if (sequences->is_satisfied())
+        {
+          sequences->retire_predecessors();
+        }
+        if (sequences->is_saturated())
         {
           sequences->retire();
-        }
-        if (call_count == max_calls)
-        {
           this->unlink();
           saturated_list.push_back(this);
         }
@@ -3850,8 +4061,8 @@ template <typename T>
         reason,
         name,
         params_string(val),
-        min_calls,
-        call_count,
+        sequences->get_min_calls(),
+        sequences->get_calls(),
         loc);
     }
 
@@ -3879,10 +4090,12 @@ template <typename T>
     set_sequence(
       T&& ... t)
     {
-      auto seq = new sequence_handler<sizeof...(T)>(name,
-                                                    loc,
-                                                    std::forward<T>(t)...);
-      sequences.reset(seq);
+      using handler = sequence_handler<sizeof...(T)>;
+      auto seq = detail::make_unique<handler>(*sequences,
+                                              name,
+                                              loc,
+                                              std::forward<T>(t)...);
+      sequences = std::move(seq);
     }
 
     template <typename T>
@@ -3907,10 +4120,7 @@ template <typename T>
     condition_list<Sig>                    conditions;
     side_effect_list<Sig>                  actions;
     std::unique_ptr<return_handler<Sig>>   return_handler_obj;
-    std::unique_ptr<sequence_handler_base> sequences;
-    size_t                                 call_count = 0;
-    atomic<size_t>                         min_calls{1};
-    atomic<size_t>                         max_calls{1};
+    std::unique_ptr<sequence_handler_base> sequences = detail::make_unique<sequence_handler<0>>();
     Value                                  val;
     bool                                   reported = false;
   };
@@ -3975,10 +4185,6 @@ template <typename T>
     {
       auto lock = get_lock();
       m.matcher->hook_last(obj.trompeloeil_matcher_list(static_cast<Tag*>(nullptr)));
-      if (m.matcher->min_calls == 0 && m.matcher->sequences)
-      {
-        m.matcher->sequences->retire();
-      }
 
       return std::unique_ptr<expectation>(m.matcher);
     }
